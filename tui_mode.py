@@ -8,21 +8,22 @@ from collections import defaultdict
 from discovery import Discovery
 from receiver import Receiver
 from destination import Destination
-from connection_requestor import ConnectionRequestor
+from chat_store import ChatStore
+from config import NAME
 
 
 class Interface:
     def __init__(self):
         self.discovery = Discovery()
         self.receiver = Receiver()
-        self.requestor = ConnectionRequestor()
 
         self.events = queue.Queue()
-        self.messages = defaultdict(list)
+        self.store = ChatStore()
+        self.messages = self.store.load_messages()
         self.peers = []
         self.selected = 0
         self.selected_host = None
-        self.paired = set()
+        self.paired = self.store.paired_peers()
 
         self.focus = 2
         self.input = ""
@@ -35,11 +36,10 @@ class Interface:
         self.pending_request = None
 
         self.receiver.on_message = self.network_message
-        self.requestor.on_request = self.network_request
+        self.receiver.on_request = self.network_request
 
         self.discovery.start()
         self.receiver.start()
-        self.requestor.start()
 
     # ---------------- Networking ----------------
 
@@ -61,7 +61,7 @@ class Interface:
     def connect(self, host):
         def worker():
             try:
-                result = self.requestor.request(host)
+                result = Destination(host).request_connection()
                 self.events.put(("connected", host, result, None))
             except Exception as error:
                 self.events.put(("connected", host, False, str(error)))
@@ -96,6 +96,7 @@ class Interface:
                 self.messages[host].append(
                     ("Peer", message, time.strftime("%H:%M"))
                 )
+                self.store.add_message(host, "Peer", message)
                 self.status = f"Message received from {host}"
 
             elif kind == "sent":
@@ -110,6 +111,7 @@ class Interface:
                     self.messages[host].append(
                         ("You", message, time.strftime("%H:%M"))
                     )
+                    self.store.add_message(host, "You", message)
                     self.status = f"Message sent to {host}"
 
             elif kind == "connected":
@@ -119,6 +121,7 @@ class Interface:
                     self.status = f"Connection failed: {error}"
                 elif accepted:
                     self.paired.add(host)
+                    self.store.set_paired(host)
                     self.status = f"Connected to {host}"
                 else:
                     self.status = f"{host} declined the request"
@@ -132,7 +135,7 @@ class Interface:
         old_host = self.selected_host
 
         # Paired peers remain visible even when discovery stops seeing them.
-        self.peers = sorted(set(discovered) | self.paired)
+        self.peers = sorted(set(discovered) | self.paired | self.store.known_peers())
 
         if old_host in self.peers:
             self.selected = self.peers.index(old_host)
@@ -225,33 +228,31 @@ class Interface:
     # ---------------- Peer panel ----------------
 
     def draw_peers(self, screen, y, x, height, width):
-        self.box(
-            screen, y, x, height, width,
-            "Peers", self.focus == 0
-        )
+        self.box(screen, y, x, height, width, "Peers", self.focus == 0)
 
         if not self.peers:
-            self.put(screen, y + 2, x + 2, "Searching for peers...",
-                     curses.A_DIM)
+            self.put(screen, y + 2, x + 2, "Searching for peers...", curses.A_DIM)
             return
 
         visible = height - 3
-        start = 0
-
-        if self.selected >= visible:
-            start = self.selected - visible + 1
+        start = max(0, self.selected - visible + 1)
 
         for index, host in enumerate(self.peers[start:start + visible]):
             actual = start + index
             paired = host in self.paired
 
             marker = "[+]" if paired else "[ ]"
-            label = f"{marker} {host}"
+            name = self.discovery.peer_names.get(host)
+            label = f"{marker} {name} ({host})" if name else f"{marker} {host}"
+
+            limit = max(0, width - 4)
+            if len(label) > limit:
+                label = label[:max(0, limit - 3)] + "..."
 
             if paired and host in self.discovery.peers:
-                attr = curses.color_pair(3)  # Online: green
+                attr = curses.color_pair(3)
             elif paired:
-                attr = curses.A_DIM         # Offline: grey
+                attr = curses.A_DIM
             else:
                 attr = curses.A_NORMAL
 
@@ -264,10 +265,23 @@ class Interface:
 
     def conversation_lines(self, host, width):
         lines = []
+        peer_name = self.discovery.peer_names.get(host, host)
+        inner_width = max(1, width - 4)
 
         for sender, message, timestamp in self.messages[host]:
-            prefix = f"[{timestamp}] {sender}: "
-            available = max(1, width - len(prefix) - 3)
+            if sender == "You":
+                display_sender = NAME
+            elif sender == "Peer":
+                display_sender = peer_name
+            else:
+                display_sender = sender
+
+            sender_limit = max(1, inner_width - len(f"[{timestamp}] : "))
+            if len(display_sender) > sender_limit:
+                display_sender = display_sender[:max(0, sender_limit - 3)] + "..."
+
+            prefix = f"[{timestamp}] {display_sender}: "
+            available = max(1, inner_width - len(prefix))
 
             wrapped = textwrap.wrap(
                 message,
@@ -283,7 +297,6 @@ class Interface:
 
         return lines
 
-
     def draw_chat(self, screen, y, x, height, width):
         self.box(
             screen, y, x, height, width,
@@ -296,12 +309,18 @@ class Interface:
             self.put(screen, y + 2, x + 2, "Select a peer to begin.")
             return
 
+        peer_name = self.discovery.peer_names.get(host, host)
+        peer_label = f"{peer_name} ({host})" if peer_name != host else host
+
+        limit = max(0, width - 4)
+        if len(peer_label) > limit:
+            peer_label = peer_label[:max(0, limit - 3)] + "..."
+
         self.put(
             screen, y + 1, x + 2,
-            host,
+            peer_label,
             curses.color_pair(2) | curses.A_BOLD
         )
-
         # Reserve the last three rows for the message input.
         available = height - 6
         lines = self.conversation_lines(host, width)
@@ -359,14 +378,25 @@ class Interface:
         )
 
         if self.focus == 2:
-            try:
-                screen.move(
-                    input_y,
-                    min(x + 2 + self.cursor - self.input_offset, x + width - 2)
-                )
-            except curses.error:
-                pass
+            cursor_x = x + 2 + self.cursor - self.input_offset
 
+            if cursor_x < x + width - 2:
+                index = self.cursor - self.input_offset
+                char = (
+                    self.input[index]
+                    if index < len(visible)
+                    else " "
+                )
+
+                try:
+                    screen.addch(
+                        input_y,
+                        cursor_x,
+                        char,
+                        curses.A_REVERSE
+                    )
+                except curses.error:
+                    pass
 
 
     # ---------------- Status and dialogs ----------------
@@ -462,6 +492,7 @@ class Interface:
 
         if accepted:
             self.paired.add(request["host"])
+            self.store.set_paired(request["host"])
             self.status = f"Accepted {request['host']}"
         else:
             self.status = f"Rejected {request['host']}"
@@ -593,7 +624,10 @@ class Interface:
     # ---------------- Main loop ----------------
 
     def run(self, screen):
-        curses.curs_set(1)
+        try:
+            curses.curs_set(0)
+        except:
+            pass
         screen.keypad(True)
         screen.timeout(50)
 
@@ -622,12 +656,13 @@ class Interface:
         for component in (
             self.discovery,
             self.receiver,
-            self.requestor
         ):
             try:
                 component.stop()
             except Exception:
                 pass
+
+        self.store.close()
 
 
 def main():

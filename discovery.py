@@ -3,16 +3,13 @@ import threading
 import time
 import secrets
 
+from config import NAME, DISCOVERY_PORT
+
 
 class Discovery:
-    """LAN peer discovery using the existing MYMSG/1 UDP protocol.
+    """LAN peer discovery using MYMSG/1 UDP broadcasts."""
 
-    The public interface and wire format remain compatible with older
-    MYMSG clients. Peers are retained until their last response expires,
-    rather than being erased at the start of every discovery sweep.
-    """
-
-    PORT = 5001
+    PORT = DISCOVERY_PORT
     BROADCAST = "255.255.255.255"
 
     REQUEST = b"MYMSG/1 DISCOVER "
@@ -22,9 +19,12 @@ class Discovery:
         self.interval = interval
         self.window = window
         self.peer_timeout = max(float(peer_timeout), float(interval + window))
+        self.name = str(NAME).strip() or socket.gethostname()
 
-        # host -> monotonic timestamp of the most recent valid response
+        # IP -> last-seen monotonic timestamp; names are kept separately so
+        # the public .peers interface remains a list of IP addresses.
         self._peers = {}
+        self._peer_names = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
@@ -33,11 +33,8 @@ class Discovery:
 
     @staticmethod
     def _get_local_addresses():
-        """Collect local IPv4 addresses without requiring third-party modules."""
         addresses = {"127.0.0.1"}
 
-        # Hostname resolution catches addresses configured in the system's
-        # hosts/DNS configuration.
         try:
             hostname = socket.gethostname()
             for item in socket.getaddrinfo(
@@ -52,8 +49,6 @@ class Discovery:
         except OSError:
             pass
 
-        # Determine the source address selected for the default route.
-        # UDP connect() does not transmit a packet.
         probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             probe.connect(("192.0.2.1", 9))
@@ -63,8 +58,6 @@ class Discovery:
         finally:
             probe.close()
 
-        # On Linux, enumerate addresses on every interface. fcntl is
-        # optional so importing this module remains portable.
         try:
             import fcntl
             import struct
@@ -90,6 +83,13 @@ class Discovery:
             self._expire_peers(now)
             return list(self._peers)
 
+    @property
+    def peer_names(self):
+        now = time.monotonic()
+        with self._lock:
+            self._expire_peers(now)
+            return self._peer_names.copy()
+
     def _expire_peers(self, now):
         expired = [
             host for host, last_seen in self._peers.items()
@@ -97,6 +97,7 @@ class Discovery:
         ]
         for host in expired:
             del self._peers[host]
+            self._peer_names.pop(host, None)
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -106,15 +107,11 @@ class Discovery:
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-            # SO_REUSEPORT is not available on every platform. It is not
-            # required for normal operation, so treat it as optional.
             if hasattr(socket, "SO_REUSEPORT"):
                 try:
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
                 except OSError:
                     pass
-
             sock.bind(("", self.PORT))
             sock.settimeout(0.25)
         except OSError:
@@ -124,7 +121,6 @@ class Discovery:
         self._socket = sock
         self._stop.clear()
         self._local_addresses = self._get_local_addresses()
-
         self._thread = threading.Thread(
             target=self._sweep,
             args=(sock,),
@@ -135,11 +131,10 @@ class Discovery:
 
     def _sweep(self, sock):
         while not self._stop.is_set():
-            token = secrets.token_bytes(8)
-
+            own_token = secrets.token_bytes(8)
             try:
                 sock.sendto(
-                    self.REQUEST + token,
+                    self.REQUEST + own_token,
                     (self.BROADCAST, self.PORT),
                 )
             except OSError:
@@ -148,7 +143,6 @@ class Discovery:
                 continue
 
             deadline = time.monotonic() + self.window
-
             while not self._stop.is_set():
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -162,33 +156,46 @@ class Discovery:
                     return
 
                 host = address[0]
-
-                # Ignore loopback and every local interface address. This
-                # also protects against receiving our own broadcast.
                 if host in self._local_addresses:
                     continue
 
                 if data.startswith(self.REQUEST):
-                    # Preserve the original MYMSG/1 request/response format.
+                    token = data[len(self.REQUEST):]
+                    if len(token) != 8:
+                        continue
+                    response = (
+                        self.RESPONSE
+                        + token.hex().encode("ascii")
+                        + b" "
+                        + self.name.encode("utf-8")
+                    )
                     try:
-                        sock.sendto(
-                            self.RESPONSE + data[len(self.REQUEST):],
-                            address,
-                        )
+                        sock.sendto(response, address)
                     except OSError:
                         if self._stop.is_set():
                             return
 
-                elif data == self.RESPONSE + token:
+                elif data.startswith(self.RESPONSE):
+                    payload = data[len(self.RESPONSE):]
+                    token_hex, separator, encoded_name = payload.partition(b" ")
+                    if not separator or token_hex != own_token.hex().encode("ascii"):
+                        continue
+                    try:
+                        peer_name = encoded_name.decode("utf-8").strip()
+                    except UnicodeDecodeError:
+                        continue
+                    if not peer_name:
+                        continue
+                    now = time.monotonic()
                     with self._lock:
-                        self._peers[host] = time.monotonic()
-                        self._expire_peers(time.monotonic())
+                        self._peers[host] = now
+                        self._peer_names[host] = peer_name
+                        self._expire_peers(now)
 
             self._stop.wait(self.interval)
 
     def stop(self):
         self._stop.set()
-
         sock = self._socket
         if sock:
             try:
@@ -199,7 +206,6 @@ class Discovery:
         thread = self._thread
         if thread and thread is not threading.current_thread():
             thread.join(timeout=2)
-
         self._thread = None
         self._socket = None
 
@@ -207,10 +213,9 @@ class Discovery:
 if __name__ == "__main__":
     discovery = Discovery()
     discovery.start()
-
     try:
         while True:
-            print("Available peers:", discovery.peers)
+            print("Available peers:", discovery.peer_names)
             time.sleep(1)
     except KeyboardInterrupt:
         discovery.stop()

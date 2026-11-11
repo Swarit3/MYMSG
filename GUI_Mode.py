@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 from discovery import Discovery
 from receiver import Receiver
 from destination import Destination
-from connection_requestor import ConnectionRequestor
+from chat_store import ChatStore
 
 
 class MessageInput(QLineEdit):
@@ -60,18 +60,18 @@ class Interface(QMainWindow):
         self.setMinimumSize(720, 460)
 
         self.events = queue.Queue()
-        self.messages = {}
+        self.store = ChatStore()
+        self.messages = self.store.load_messages()
         self.peers = []
-        self.paired = set()
+        self.paired = self.store.paired_peers()
         self.selected_host = None
         self.pending_request = None
         self.running = True
 
         self.discovery = Discovery()
         self.receiver = Receiver()
-        self.requestor = ConnectionRequestor()
         self.receiver.on_message = self.network_message
-        self.requestor.on_request = self.network_request
+        self.receiver.on_request = self.network_request
 
         self._build_ui()
         self._apply_style()
@@ -82,7 +82,6 @@ class Interface(QMainWindow):
 
         self.discovery.start()
         self.receiver.start()
-        self.requestor.start()
         self.statusBar().showMessage("Searching for peers…")
 
     # ---------------- UI ----------------
@@ -256,7 +255,7 @@ class Interface(QMainWindow):
 
         def worker():
             try:
-                accepted = self.requestor.request(host)
+                accepted = Destination(host).request_connection()
                 self.events.put(("connected", host, accepted, None))
             except Exception as error:
                 self.events.put(("connected", host, False, str(error)))
@@ -306,6 +305,7 @@ class Interface(QMainWindow):
                 self.messages.setdefault(host, []).append(
                     ("Peer", message, time.strftime("%H:%M"))
                 )
+                self.store.add_message(host, "Peer", message)
                 self.statusBar().showMessage(f"Message received from {host}", 5000)
                 if host == self.selected_host:
                     self.render_conversation()
@@ -316,6 +316,8 @@ class Interface(QMainWindow):
                 self.messages.setdefault(host, []).append(
                     (sender, message, time.strftime("%H:%M"))
                 )
+                if not error:
+                    self.store.add_message(host, "You", message)
                 self.statusBar().showMessage(
                     f"Send failed: {error}" if error else f"Message sent to {host}", 5000
                 )
@@ -329,6 +331,7 @@ class Interface(QMainWindow):
                     self.statusBar().showMessage(f"Connection failed: {error}", 7000)
                 elif accepted:
                     self.paired.add(host)
+                    self.store.set_paired(host)
                     self.statusBar().showMessage(f"Connected to {host}", 5000)
                 else:
                     self.statusBar().showMessage(f"{host} declined the request", 5000)
@@ -346,13 +349,14 @@ class Interface(QMainWindow):
                 request["event"].set()
                 if request["accepted"]:
                     self.paired.add(request["host"])
+                    self.store.set_paired(request["host"])
                     self.statusBar().showMessage(f"Accepted {request['host']}", 5000)
                 else:
                     self.statusBar().showMessage(f"Rejected {request['host']}", 5000)
 
     def refresh_peers(self):
         discovered = set(self.discovery.peers)
-        hosts = sorted(discovered | self.paired)
+        hosts = sorted(discovered | self.paired | self.store.known_peers())
         if hosts == self.peers:
             self._refresh_peer_appearance(discovered)
             return
@@ -376,12 +380,15 @@ class Interface(QMainWindow):
         self._refresh_peer_appearance(discovered)
 
     def _refresh_peer_appearance(self, discovered):
+        names = self.discovery.peer_names
         for index, host in enumerate(self.peers):
             item = self.peer_list.item(index)
             paired = host in self.paired
             marker = "●" if paired else "○"
             state = "Connected" if paired else "Discovered"
-            item.setText(f"{marker}  {host}\n     {state}")
+            name = names.get(host)
+            label = f"{name}  ({host})" if name else host
+            item.setText(f"{marker}  {label}\n     {state}")
             if paired and host in discovered:
                 item.setForeground(QColor("#70d6a0"))
                 item.setToolTip("Paired · Online")
@@ -405,7 +412,7 @@ class Interface(QMainWindow):
             self.conversation.clear()
             return
 
-        self.chat_title.setText(host)
+        self.chat_title.setText(self.discovery.peer_names.get(host, host))
         self.peer_state.setText("PAIRED" if host in self.paired else "NOT PAIRED")
         palette = self.conversation.palette()
         text_color = palette.color(QPalette.Text).name()
@@ -460,11 +467,12 @@ class Interface(QMainWindow):
     def closeEvent(self, event):
         self.running = False
         self.timer.stop()
-        for component in (self.discovery, self.receiver, self.requestor):
+        for component in (self.discovery, self.receiver):
             try:
                 component.stop()
             except Exception:
                 pass
+        self.store.close()
         event.accept()
 
 
